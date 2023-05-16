@@ -11,7 +11,7 @@ namespace QuizonomyAPI.Models
         protected override void OnModelCreating(ModelBuilder modelBuilder)
         {
             modelBuilder.HasPostgresExtension("pg_trgm");
-            
+
         }
 
         public DbSet<User> Users { get; set; }

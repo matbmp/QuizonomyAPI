@@ -19,6 +19,7 @@ namespace QuizonomyAPI
             CreateMap<User, UserGetDTO>();
             CreateMap<User, UserExtendedGetDTO>();
 
+            CreateMap<Session, SessionDTO>();
         }
     }
 }

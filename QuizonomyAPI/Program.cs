@@ -11,6 +11,9 @@ using QuizonomyAPI.Middleware;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using System.Security.Claims;
+using System.Security.Cryptography;
+
+AppContext.SetSwitch("Npgsql.EnableLegacyTimestampBehavior", true);
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -18,11 +21,6 @@ AuthSettings authSettings = new AuthSettings();
 builder.Configuration.GetSection("Auth").Bind(authSettings);
 authSettings.CookieOptions = new CookieOptions()
 {
-    HttpOnly = true,
-    SameSite = SameSiteMode.None,
-    Secure = false,
-    //Secure = true,
-    IsEssential = true,
     MaxAge = TimeSpan.FromHours(1),
 };
 builder.Services.AddSingleton(authSettings);
@@ -61,15 +59,14 @@ var app = builder.Build();
 
 if (app.Environment.IsDevelopment())
 {
-    app.UseCors();
     app.UseSwagger();
     app.UseSwaggerUI();
 }
-
-app.UseAuthentication();
-app.UseAuthorization();
+app.UseCors();
 
 app.UseHttpsRedirection();
+app.UseAuthentication();
+app.UseAuthorization();
 
 
 app.MapGet("/quiz/{id}", async (long id, QuizonomyDbContext db, IMapper mapper) => {
@@ -79,8 +76,17 @@ app.MapGet("/quiz/{id}", async (long id, QuizonomyDbContext db, IMapper mapper) 
     });
 app.MapGet("/quiz", async ([FromQuery] string searchQuery, [FromQuery] int skip, [FromQuery] int take, [FromServices]QuizonomyDbContext db, [FromServices]IMapper mapper) =>
 {
-    var quizzes = await db.Quizzes.OrderBy(q => -EF.Functions.TrigramsSimilarity(q.Name, searchQuery))
+    List<Quiz> quizzes;
+    if(searchQuery != null)
+    {
+        quizzes = await db.Quizzes.OrderBy(q => -EF.Functions.TrigramsSimilarity(q.Name, searchQuery))
         .Skip(skip).Take(take).Include(q => q.Author).Include(q => q.Questions).ToListAsync();
+    }
+    else
+    {
+        quizzes = await db.Quizzes.OrderBy(q => -q.AttemptCount).Skip(skip).Take(take)
+        .Include(q => q.Author).Include(q => q.Questions).ToListAsync();
+    }
     return mapper.Map<ICollection<QuizGetDTO>>(quizzes);
 });
 app.MapGet("/quiz/random", async ([FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
@@ -88,25 +94,28 @@ app.MapGet("/quiz/random", async ([FromServices] QuizonomyDbContext db, [FromSer
     var quizzes = await db.Quizzes.OrderBy(q => Guid.NewGuid()).Take(1).Include(q => q.Author).Include(q => q.Questions).ToListAsync();
     return mapper.Map<ICollection<QuizGetDTO>>(quizzes);
 });
+app.MapGet("/quiz/popular", async ([FromQuery] int take, [FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
+{
+    var quizzes = await db.Quizzes.OrderBy(q => -q.AttemptCount).Take(take).Include(q => q.Author).Include(q => q.Questions).ToListAsync();
+    return mapper.Map<ICollection<QuizGetDTO>>(quizzes);
+});
 app.MapGet("/quiz/daily", [Authorize] async ([FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper, HttpContext context) =>
 {
-    var identity = context.User.Identity as ClaimsIdentity;
-    if(identity is null) return Results.Problem();
-    var nameClaim = identity.FindFirst(ClaimTypes.Name);
-    if (nameClaim is null) return Results.Problem();
-    var user = db.Users.Where(u => u.Username== nameClaim.Value).FirstOrDefault();
-    if(user is null) return Results.Problem();
+    if (context.User.Identity is not ClaimsIdentity identity) return Results.Problem();
+    if (identity.FindFirst(ClaimTypes.Name) is not Claim nameClaim) return Results.Problem();
+    if (db.Users.Where(u => u.Username == nameClaim.Value).FirstOrDefault() is not User user) return Results.Problem();
 
-    if(user.DailyQuizDate.Date != DateTime.Now.Date)
+    if(user.DailyQuizDate.Date != DateTimeOffset.Now.Date)
     {
         user.DailyCount = 3;
-        user.DailyQuizDate = DateTime.Now.Date;
-        await db.SaveChangesAsync();
+        user.DailyQuizDate = DateTimeOffset.Now.Date;
     }
+    if (user.DailyCount <= 0) return Results.BadRequest();
     var quiz = await db.Quizzes.OrderBy(q => Guid.NewGuid()).FirstOrDefaultAsync();
     if(quiz is null) return Results.NotFound();
     user.DailyQuizId = quiz.Id;
     user.DailyCount--;
+    await db.SaveChangesAsync();
     return Results.Ok(quiz.Id);
 });
 app.MapPost("/quiz/submit", [Authorize] async ([FromBody]QuizAttemptPostDTO attemptDTO, [FromServices] QuizonomyDbContext db, HttpContext context) =>
@@ -131,18 +140,44 @@ app.MapPost("/quiz/submit", [Authorize] async ([FromBody]QuizAttemptPostDTO atte
         user.WeeklyQuoins += quoins;
         user.MonthlyQuoins += quoins;
     }
-
     var attempt = await db.QuizAttempts.Where(qa => qa.UserId == user.Id && qa.QuizId == attemptDTO.QuizId).FirstOrDefaultAsync();
     if(attempt is not null)
     {
-        float oldRatio = attempt.CorrectCount / (float)(attempt.Time.Ticks / TimeSpan.TicksPerMillisecond);
-        float newRatio = attemptDTO.CorrectCount / (float)(attemptDTO.Time.Ticks / TimeSpan.TicksPerMillisecond);
+        float oldRatio = 1000*attempt.CorrectCount / (float)(attempt.TimeMilliseconds);
+        float newRatio = 1000*attemptDTO.CorrectCount / (float)(attemptDTO.TimeMilliseconds);
         if (newRatio > oldRatio)
         {
-            attempt.Time = attemptDTO.Time;
+            attempt.TimeMilliseconds = attemptDTO.TimeMilliseconds;
             attempt.CorrectCount = attemptDTO.CorrectCount;
         }
     }
+    else
+    {
+        attempt = new QuizAttempt()
+        {
+            CorrectCount = attemptDTO.CorrectCount,
+            QuizId = attemptDTO.QuizId,
+            TimeMilliseconds = attemptDTO.TimeMilliseconds,
+            UserId = user.Id,
+        };
+        db.QuizAttempts.Add(attempt);
+    }
+
+    float attemptScore = 1000 * attemptDTO.CorrectCount / (float)(attemptDTO.TimeMilliseconds);
+    var quiz2 = db.Quizzes.Where(q => q.Id == attemptDTO.QuizId).FirstOrDefault();
+    if(quiz2 is not null)
+    {
+        quiz2.AttemptCount++;
+        if (!quiz2.BestAttemptScore.HasValue)
+        {
+            quiz2.BestAttemptScore = attemptScore;
+        }
+        else if (attemptScore > quiz2.BestAttemptScore)
+        {
+            quiz2.BestAttemptScore = attemptScore;
+        }
+    }
+
     await db.SaveChangesAsync();
     return Results.Ok();
 });
@@ -160,6 +195,22 @@ app.MapGet("/user", async ([FromServices] QuizonomyDbContext db, [FromServices] 
     var users = await db.Users.ToListAsync();
     return mapper.Map<List<UserGetDTO>>(users);
 });
+
+app.MapGet("/user/rankings", async([FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
+{
+    int take = 10;
+    var daily = db.Users.OrderBy(u => -u.DailyQuoins).Take(take).ToList();
+    var weekly = db.Users.OrderBy(u => -u.WeeklyQuoins).Take(take).ToList();
+    var monthly = db.Users.OrderBy(u => -u.MonthlyQuoins).Take(take).ToList();
+
+    return Results.Ok(new UserRankingGetDTO()
+    {
+        Daily = mapper.Map<List<UserExtendedGetDTO>>(daily),
+        Weekly = mapper.Map<List<UserExtendedGetDTO>>(weekly),
+        Monthly = mapper.Map<List<UserExtendedGetDTO>>(monthly),
+    });
+}); 
+
 app.MapPost("/user", async ([FromBody] UserPostDTO userDTO, [FromServices] IValidator<UserPostDTO> validator,
     [FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
 {
@@ -175,36 +226,38 @@ app.MapPost("/user", async ([FromBody] UserPostDTO userDTO, [FromServices] IVali
     return Results.Created($"/question/{user.Id}", user.Id);
 });
 app.MapPost("/session", async ([FromBody] UserPostDTO userDTO,
-    [FromServices] QuizonomyDbContext db, HttpContext context, [FromServices] TokenService tokenService, AuthSettings auth) =>
+    [FromServices] QuizonomyDbContext db, HttpContext context, [FromServices] TokenService tokenService, AuthSettings auth, IMapper mapper) =>
 {
     var user = await db.Users.Where(u => u.Username == userDTO.Username).FirstOrDefaultAsync();
     if(user is null)
     {
-        return Results.NotFound();
+        return Results.NotFound("Nie odnaleziono u¿ytkownika");
     }
     if (!BCrypt.Net.BCrypt.Verify(userDTO.Password, user.Password))
     {
-        return Results.Unauthorized();
+        return Results.NotFound("Dane logowania nie s¹ poprawne");
     }
 
-    var access = tokenService.GenerateAccessTokenFor(user);
-    context.Response.Cookies.Append(auth.AccessCookie, access, authSettings.CookieOptions);
-    var refresh = await tokenService.GenerateRefreshTokenForAsync(user);
-    context.Response.Cookies.Append(auth.RefreshCookie, refresh, authSettings.CookieOptions);
-    return Results.Ok();
+    string key = Convert.ToBase64String(RandomNumberGenerator.GetBytes(256));
+    var session = new Session() { Key = key, UserId = user.Id };
+    db.Sessions.Add(session);
+    await db.SaveChangesAsync();
+
+    return Results.Ok(mapper.Map<SessionDTO>(session));
 });
-app.MapDelete("/session", [Authorize] async ([FromServices] QuizonomyDbContext db, HttpContext context,
-    [FromServices] TokenService tokenService, AuthSettings auth) =>
+app.MapDelete("/session", [Authorize] async ([FromQuery] string key, [FromServices] QuizonomyDbContext db, HttpContext context) =>
 {
-    var refresh = context.Request.Cookies[auth.RefreshCookie];
-    if(refresh is not null)
-    {
-        await tokenService.InvalidateTokenAsync(refresh);
-        context.Response.Cookies.Delete(auth.RefreshCookie);
-        return Results.Ok("Session invalidated");
-    }
-    context.Response.Cookies.Delete(auth.AccessCookie);
-    return Results.Ok("No session present");
+    var identity = context.User.Identity as ClaimsIdentity;
+    if (identity is null) return Results.Problem();
+    var nameClaim = identity.FindFirst(ClaimTypes.Name);
+    if (nameClaim is null) return Results.Problem();
+    var user = db.Users.Where(u => u.Username == nameClaim.Value).FirstOrDefault();
+    if (user is null) return Results.Problem();
+
+    var session = await db.Sessions.Where(s => s.Key == key && s.UserId == user.Id).FirstOrDefaultAsync();
+    if (session is null) return Results.NotFound();
+    db.Sessions.Remove(session);
+    return Results.Ok();
 });
 app.MapGet("/session", [Authorize] async ([FromServices] QuizonomyDbContext db, HttpContext context, IMapper mapper) =>
 {

@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using QuizonomyAPI.Models;
@@ -11,9 +12,10 @@ using QuizonomyAPI.Models;
 namespace QuizonomyAPI.Models.migration
 {
     [DbContext(typeof(QuizonomyDbContext))]
-    partial class QuizonomyDbContextModelSnapshot : ModelSnapshot
+    [Migration("20230515201234_addAttemptCount")]
+    partial class addAttemptCount
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -69,9 +71,6 @@ namespace QuizonomyAPI.Models.migration
                     b.Property<long>("AuthorId")
                         .HasColumnType("bigint");
 
-                    b.Property<float?>("BestAttemptScore")
-                        .HasColumnType("real");
-
                     b.Property<string>("Name")
                         .IsRequired()
                         .HasColumnType("text");
@@ -97,8 +96,8 @@ namespace QuizonomyAPI.Models.migration
                     b.Property<long>("QuizId")
                         .HasColumnType("bigint");
 
-                    b.Property<float>("TimeMilliseconds")
-                        .HasColumnType("real");
+                    b.Property<DateTime>("Time")
+                        .HasColumnType("timestamp with time zone");
 
                     b.Property<long>("UserId")
                         .HasColumnType("bigint");
