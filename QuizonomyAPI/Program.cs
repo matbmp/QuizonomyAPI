@@ -69,82 +69,81 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 
-app.MapGet("/quiz/{id}", async (long id, QuizonomyDbContext db, IMapper mapper) => {
-    var quiz = await db.Quizzes.Where(q => q.Id == id).Include(q => q.Author).Include(q => q.Questions).FirstOrDefaultAsync();
-    if (quiz is null) return Results.NotFound();
-    return Results.Ok(mapper.Map<QuizGetDTO>(quiz));
-    });
-app.MapGet("/quiz", async ([FromQuery] string searchQuery, [FromQuery] int skip, [FromQuery] int take, [FromServices]QuizonomyDbContext db, [FromServices]IMapper mapper) =>
+app.MapGet("/quiz/{id}", async (long id, QuizonomyDbContext db, IMapper mapper) =>
 {
-    List<Quiz> quizzes;
-    if(searchQuery != null)
+    var quiz = await db.Quizzes.ById(id).WithAuthorAndQuestions().FirstOrDefaultAsync();
+    return quiz switch
     {
-        quizzes = await db.Quizzes.OrderBy(q => -EF.Functions.TrigramsSimilarity(q.Name, searchQuery))
-        .Skip(skip).Take(take).Include(q => q.Author).Include(q => q.Questions).ToListAsync();
-    }
-    else
-    {
-        quizzes = await db.Quizzes.OrderBy(q => -q.AttemptCount).Skip(skip).Take(take)
-        .Include(q => q.Author).Include(q => q.Questions).ToListAsync();
-    }
-    return mapper.Map<ICollection<QuizGetDTO>>(quizzes);
+        null => Results.NotFound(),
+        Quiz => Results.Ok(mapper.Map<QuizGetDTO>(quiz))
+    };
 });
-app.MapGet("/quiz/random", async ([FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
+app.MapGet("/quiz", async ([FromQuery] string searchQuery, [FromQuery] int skip, [FromQuery] int take,
+    [FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
 {
-    var quizzes = await db.Quizzes.OrderBy(q => Guid.NewGuid()).Take(1).Include(q => q.Author).Include(q => q.Questions).ToListAsync();
+    // Je¿eli zapytanie zawiera tekst wyszukiwania to kolejnoœæ jest na podstawie trygramów
+    // Je¿eli zapytanie nie zawiera tekstu wyszukiwania to kolejnoœæ jest na podstawie iloœci wykonañ danego quizu
+    var dbQuery = searchQuery switch
+    {
+        string => db.Quizzes.OrderBy(q => -EF.Functions.TrigramsSimilarity(q.Name, searchQuery)),
+        null => db.Quizzes.OrderBy(q => -q.AttemptCount)
+    };
+    var quizzes = await dbQuery.SkipTake(skip, take).WithAuthorAndQuestions().ToListAsync();
     return mapper.Map<ICollection<QuizGetDTO>>(quizzes);
 });
 app.MapGet("/quiz/popular", async ([FromQuery] int take, [FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
 {
-    var quizzes = await db.Quizzes.OrderBy(q => -q.AttemptCount).Take(take).Include(q => q.Author).Include(q => q.Questions).ToListAsync();
+    // kolejnoœæ na podstawie iloœci wykonanñ quizu
+    var quizzes = await db.Quizzes.OrderBy(q => -q.AttemptCount).Take(take).WithAuthorAndQuestions().ToListAsync();
     return mapper.Map<ICollection<QuizGetDTO>>(quizzes);
 });
 app.MapGet("/quiz/daily", [Authorize] async ([FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper, HttpContext context) =>
 {
-    if (context.User.Identity is not ClaimsIdentity identity) return Results.Problem();
-    if (identity.FindFirst(ClaimTypes.Name) is not Claim nameClaim) return Results.Problem();
-    if (db.Users.Where(u => u.Username == nameClaim.Value).FirstOrDefault() is not User user) return Results.Problem();
-
-    if(user.DailyQuizDate.Date != DateTimeOffset.Now.Date)
-    {
-        user.DailyCount = 3;
-        user.DailyQuizDate = DateTimeOffset.Now.Date;
-    }
+    // Zapytanie przesz³o przez middleware autoryzacji ale nie mo¿na odczytaæ u¿ytkownika - b³¹d serwera
+    if (await getLoggedUserAsync(db, context) is not User user) return Results.Problem();
+    // U¿tkownik wyczerpa³ dzisiejsze szanse
     if (user.DailyCount <= 0) return Results.BadRequest();
-    var quiz = await db.Quizzes.OrderBy(q => Guid.NewGuid()).FirstOrDefaultAsync();
-    if(quiz is null) return Results.NotFound();
+    // Pobieraj¹æ losowy quiz, nie znaleziono ¿adnego w bazie danych
+    if (await db.Quizzes.OrderBy(q => Guid.NewGuid()).FirstOrDefaultAsync() is not Quiz quiz) return Results.NotFound();
+    
+    // Po obs³u¿eniu przypdaków negatynych dokonujemy przypisania quizu do u¿ytkownika
     user.DailyQuizId = quiz.Id;
     user.DailyCount--;
     await db.SaveChangesAsync();
     return Results.Ok(quiz.Id);
 });
-app.MapPost("/quiz/submit", [Authorize] async ([FromBody]QuizAttemptPostDTO attemptDTO, [FromServices] QuizonomyDbContext db, HttpContext context) =>
+app.MapPost("/quiz/submit", [Authorize] async ([FromBody] QuizAttemptPostDTO attemptDTO, [FromServices] QuizonomyDbContext db, HttpContext context) =>
 {
-    var identity = context.User.Identity as ClaimsIdentity;
-    if (identity is null) return Results.Problem();
-    var nameClaim = identity.FindFirst(ClaimTypes.Name);
-    if (nameClaim is null) return Results.Problem();
-    var user = db.Users.Where(u => u.Username == nameClaim.Value).FirstOrDefault();
-    if (user is null) return Results.Problem();
+    // Zapytanie przesz³o przez middleware autoryzacji ale nie mo¿na odczytaæ u¿ytkownika - b³¹d serwera
+    if (await getLoggedUserAsync(db, context) is not User user) return Results.Problem();
 
-    if(user.DailyQuizId == attemptDTO.QuizId)
+    int quoins = 0;
+
+    // U¿ytkownik wykona³ przypisany mu quiz
+    if (user.DailyQuizId == attemptDTO.QuizId)
     {
-        var quiz = await db.Quizzes.Where(q => q.Id == attemptDTO.QuizId).Include(q => q.Questions).FirstOrDefaultAsync();
-        if (quiz is null) return Results.Problem();
+        var quiz = await db.Quizzes.ById(attemptDTO.QuizId).WithAuthorAndQuestions().FirstOrDefaultAsync();
+        if (quiz is null) return Results.NotFound();
+
+        // Uniewa¿niamy przypisanie quizu
         user.DailyQuizId = -1;
 
+        // Wyliczamy zdobyte punkty i przypisujemy je u¿ytkownikowi
         float correctCount = attemptDTO.CorrectCount;
         int questionCount = quiz.Questions.Count();
-        int quoins = (int) ((correctCount / questionCount) * (100 * MathF.Sqrt(questionCount)));
+        quoins = (int)((correctCount / questionCount) * (100 * MathF.Sqrt(questionCount)));
         user.DailyQuoins += quoins;
         user.WeeklyQuoins += quoins;
         user.MonthlyQuoins += quoins;
     }
-    var attempt = await db.QuizAttempts.Where(qa => qa.UserId == user.Id && qa.QuizId == attemptDTO.QuizId).FirstOrDefaultAsync();
-    if(attempt is not null)
+    var attempt = await db.QuizAttempts.ByQuizIdAndUserId(attemptDTO.QuizId, user.Id).FirstOrDefaultAsync();
+
+    // je¿eli próba wype³nienia quizu nie istnieje w bazie to j¹ dodajemy
+    // w przeciwnym razie modyfikujemy wartoœæ w bazie je¿eli nowy wynik jest lepszy (wy¿szy)
+    if (attempt is not null)
     {
-        float oldRatio = 1000*attempt.CorrectCount / (float)(attempt.TimeMilliseconds);
-        float newRatio = 1000*attemptDTO.CorrectCount / (float)(attemptDTO.TimeMilliseconds);
+        float oldRatio = 1000 * attempt.CorrectCount / (float)(attempt.TimeMilliseconds);
+        float newRatio = 1000 * attemptDTO.CorrectCount / (float)(attemptDTO.TimeMilliseconds);
         if (newRatio > oldRatio)
         {
             attempt.TimeMilliseconds = attemptDTO.TimeMilliseconds;
@@ -163,9 +162,10 @@ app.MapPost("/quiz/submit", [Authorize] async ([FromBody]QuizAttemptPostDTO atte
         db.QuizAttempts.Add(attempt);
     }
 
+    // Modyfikujemy najlepsze podejœcie je¿eli rozwa¿ane podejœcie rzeczywiœcie jest najlepsze
     float attemptScore = 1000 * attemptDTO.CorrectCount / (float)(attemptDTO.TimeMilliseconds);
-    var quiz2 = db.Quizzes.Where(q => q.Id == attemptDTO.QuizId).FirstOrDefault();
-    if(quiz2 is not null)
+    var quiz2 = db.Quizzes.ById(attemptDTO.QuizId).FirstOrDefault();
+    if (quiz2 is not null)
     {
         quiz2.AttemptCount++;
         if (!quiz2.BestAttemptScore.HasValue)
@@ -179,7 +179,8 @@ app.MapPost("/quiz/submit", [Authorize] async ([FromBody]QuizAttemptPostDTO atte
     }
 
     await db.SaveChangesAsync();
-    return Results.Ok();
+    QuizSubmitResultDTO result = new QuizSubmitResultDTO() { Points = quoins };
+    return Results.Ok(result);
 });
 app.MapPost("/quiz", async ([FromBody] QuizPostDTO quizDTO, [FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
 {
@@ -191,12 +192,16 @@ app.MapPost("/quiz", async ([FromBody] QuizPostDTO quizDTO, [FromServices] Quizo
 });
 
 
-app.MapGet("/user", async ([FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) => {
+
+
+
+app.MapGet("/user", async ([FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
+{
     var users = await db.Users.ToListAsync();
     return mapper.Map<List<UserGetDTO>>(users);
 });
 
-app.MapGet("/user/rankings", async([FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
+app.MapGet("/user/rankings", ([FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
 {
     int take = 10;
     var daily = db.Users.OrderBy(u => -u.DailyQuoins).Take(take).ToList();
@@ -209,7 +214,7 @@ app.MapGet("/user/rankings", async([FromServices] QuizonomyDbContext db, [FromSe
         Weekly = mapper.Map<List<UserExtendedGetDTO>>(weekly),
         Monthly = mapper.Map<List<UserExtendedGetDTO>>(monthly),
     });
-}); 
+});
 
 app.MapPost("/user", async ([FromBody] UserPostDTO userDTO, [FromServices] IValidator<UserPostDTO> validator,
     [FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper) =>
@@ -223,13 +228,18 @@ app.MapPost("/user", async ([FromBody] UserPostDTO userDTO, [FromServices] IVali
     db.Users.Add(user);
     await db.SaveChangesAsync();
 
-    return Results.Created($"/question/{user.Id}", user.Id);
+    return Results.Created($"/user/{user.Id}", user.Id);
 });
+
+
+
+
+
 app.MapPost("/session", async ([FromBody] UserPostDTO userDTO,
     [FromServices] QuizonomyDbContext db, HttpContext context, [FromServices] TokenService tokenService, AuthSettings auth, IMapper mapper) =>
 {
-    var user = await db.Users.Where(u => u.Username == userDTO.Username).FirstOrDefaultAsync();
-    if(user is null)
+    var user = await db.Users.ByUsername(userDTO.Username).FirstOrDefaultAsync();
+    if (user is null)
     {
         return Results.NotFound("Nie odnaleziono u¿ytkownika");
     }
@@ -238,6 +248,7 @@ app.MapPost("/session", async ([FromBody] UserPostDTO userDTO,
         return Results.NotFound("Dane logowania nie s¹ poprawne");
     }
 
+    // Je¿eli nazwa u¿ytkownika oraz has³o s¹ poprawne to towrzymy now¹ sesjê
     string key = Convert.ToBase64String(RandomNumberGenerator.GetBytes(256));
     var session = new Session() { Key = key, UserId = user.Id };
     db.Sessions.Add(session);
@@ -247,28 +258,43 @@ app.MapPost("/session", async ([FromBody] UserPostDTO userDTO,
 });
 app.MapDelete("/session", [Authorize] async ([FromQuery] string key, [FromServices] QuizonomyDbContext db, HttpContext context) =>
 {
-    var identity = context.User.Identity as ClaimsIdentity;
-    if (identity is null) return Results.Problem();
-    var nameClaim = identity.FindFirst(ClaimTypes.Name);
-    if (nameClaim is null) return Results.Problem();
-    var user = db.Users.Where(u => u.Username == nameClaim.Value).FirstOrDefault();
-    if (user is null) return Results.Problem();
+    // Zapytanie przesz³o przez middleware autoryzacji ale nie mo¿na odczytaæ u¿ytkownika - b³¹d serwera
+    if (await getLoggedUserAsync(db, context) is not User user) return Results.Problem();
 
-    var session = await db.Sessions.Where(s => s.Key == key && s.UserId == user.Id).FirstOrDefaultAsync();
+    // Usuwamy sesjê
+    var session = await db.Sessions.ByKeyIdAndUserId(key, user.Id).FirstOrDefaultAsync();
     if (session is null) return Results.NotFound();
     db.Sessions.Remove(session);
+    await db.SaveChangesAsync();
     return Results.Ok();
 });
 app.MapGet("/session", [Authorize] async ([FromServices] QuizonomyDbContext db, HttpContext context, IMapper mapper) =>
 {
-    var identity = context.User.Identity as ClaimsIdentity;
-    if (identity is null) return Results.Problem();
-    var nameClaim = identity.FindFirst(ClaimTypes.Name);
-    if (nameClaim is null) return Results.Problem();
-    var user = db.Users.Where(u => u.Username == nameClaim.Value).FirstOrDefault();
-    if (user is null) return Results.Problem();
+    // Zapytanie przesz³o przez middleware autoryzacji ale nie mo¿na odczytaæ u¿ytkownika - b³¹d serwera
+    if (await getLoggedUserAsync(db, context) is not User user) return Results.Problem();
+
+    // Je¿eli ostanie dzienne próby zosta³y przypisane dnia wczorajszego, to przypisujemy nowe próby
+    // i ustawiamy dzisiejsz¹ datê przypisania dziennych prób
+    if (user.DailyQuizDate.Date != DateTimeOffset.Now.Date)
+    {
+        user.DailyCount = 3;
+        user.DailyQuizDate = DateTimeOffset.Now.Date;
+        db.SaveChanges();
+    }
 
     return Results.Ok(mapper.Map<UserExtendedGetDTO>(user));
 });
+
+
+
+
+
+async Task<User?> getLoggedUserAsync(QuizonomyDbContext db, HttpContext context)
+{
+    if (context.User.Identity is not ClaimsIdentity identity) return null;
+    if (identity.FindFirst(ClaimTypes.Name) is not Claim nameClaim) return null;
+    if (await db.Users.ByUsername(nameClaim.Value).FirstOrDefaultAsync() is not User user) return null;
+    return user;
+}
 
 app.Run();
