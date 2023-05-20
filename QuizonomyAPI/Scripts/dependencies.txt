@@ -1,0 +1,16 @@
+﻿Ubuntu 22.10
+
+dotnet-sdk-6.0 dotnet-runtime-6.0
+nginx
+postgresql(14.7) postgresql-contrib postgresql-14-cron
+
+
+/etc/postgresql/<version>/main/postgresql.conf
+shared_preload_libraries = 'pg_cron'    # (change requires restart)
+
+/etc/postgresql/<version>/main/pg_hba.conf
+# Connect via a unix domain socket
+cron.host = '/tmp'
+
+CREATE EXTENSION pg_cron;
+CREATE EXTENSION pg_trgm;

@@ -97,7 +97,7 @@ app.MapGet("/quiz/popular", async ([FromQuery] int take, [FromServices] Quizonom
     var quizzes = await db.Quizzes.OrderBy(q => -q.AttemptCount).Take(take).WithAuthorAndQuestions().ToListAsync();
     return mapper.Map<ICollection<QuizGetDTO>>(quizzes);
 });
-app.MapGet("/quiz/daily", [Authorize] async ([FromServices] QuizonomyDbContext db, [FromServices] IMapper mapper, HttpContext context) =>
+app.MapGet("/quiz/daily", [Authorize] async ([FromServices] QuizonomyDbContext db, HttpContext context) =>
 {
     // Zapytanie przesz³o przez middleware autoryzacji ale nie mo¿na odczytaæ u¿ytkownika - b³¹d serwera
     if (await getLoggedUserAsync(db, context) is not User user) return Results.Problem();
