@@ -12,5 +12,12 @@ shared_preload_libraries = 'pg_cron'    # (change requires restart)
 # Connect via a unix domain socket
 cron.host = '/tmp'
 
-CREATE EXTENSION pg_cron;
-CREATE EXTENSION pg_trgm;
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+SELECT cron.schedule('1 0 * * *', $$UPDATE "Users" SET "DailyQuoins" = 0;$$);
+SELECT cron.schedule('1 0 * * 0', $$UPDATE "Users" SET "WeeklyQuoins" = 0;$$);
+SELECT cron.schedule('1 0 1 * *', $$UPDATE "Users" SET "MonthlyQuoins" = 0;$$);
+
+select * from cron.job_run_details order by start_time desc limit 5;
